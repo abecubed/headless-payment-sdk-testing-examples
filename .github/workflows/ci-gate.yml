@@ -30,5 +30,11 @@ jobs:
             exit 1
           fi
 
+      - name: Run AGENTS.md Architectural Linter & Quality Governance
+        run: npm run test:governance
+
       - name: Run TypeScript Typecheck & Playwright Suite
-        run: npm run test:ci
+        run: npm run typecheck && npx playwright test --reporter=list
+
+      - name: Run Autonomous Payment Exploration Agent
+        run: npm run agent:explore

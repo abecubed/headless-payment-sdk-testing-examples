@@ -1,5 +1,12 @@
 import crypto from 'node:crypto';
-import type { Decision, GatewayResponse } from '../middleware/server.js';
+import type { Decision, GatewayResponse } from '../middleware/server.ts';
+import { DEFAULT_MOCK_ESKEY } from '../middleware/server.ts';
+
+export type SdkTransport = (
+  path: string,
+  body: Record<string, unknown>,
+  headers: Record<string, string>
+) => Promise<{ status: number; payload: GatewayResponse }>;
 
 export interface SdkResult<T = GatewayResponse> {
   ok: boolean;
@@ -41,12 +48,32 @@ export function isValidLuhn(pan: string): boolean {
 export class MobilePaymentSdkWrapper {
   private sessionId: string | null = null;
   private isBackgrounded = false;
+  private baseUrl: string;
+  private logger: SdkLogger;
+  private maxRetries: number;
+  private esKey: string;
+  private terminalId: string;
+  private transport?: SdkTransport;
 
   constructor(
-    private readonly baseUrl: string,
-    private readonly logger: SdkLogger,
-    private readonly maxRetries = 2
-  ) {}
+    baseUrl: string,
+    logger: SdkLogger,
+    maxRetries = 2,
+    esKey = DEFAULT_MOCK_ESKEY,
+    terminalId = 'TERM_MOBILE_01',
+    transport?: SdkTransport
+  ) {
+    this.baseUrl = baseUrl;
+    this.logger = logger;
+    this.maxRetries = maxRetries;
+    this.esKey = esKey;
+    this.terminalId = terminalId;
+    this.transport = transport;
+  }
+
+  public setEsKey(key: string): void {
+    this.esKey = key;
+  }
 
   public onHostAppBackgrounded(): void {
     this.isBackgrounded = true;
@@ -71,9 +98,25 @@ export class MobilePaymentSdkWrapper {
     let attempt = 0;
     while (true) {
       try {
-        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'X-ESKey': this.esKey,
+          'X-Terminal-Id': this.terminalId,
+        };
         if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
 
+        // In-memory or direct dispatch transport (bypasses TCP socket constraints in sandboxes/CI)
+        if (this.transport) {
+          const res = await this.transport(path, body, headers);
+          if (res.status >= 500 && attempt < this.maxRetries) {
+            attempt++;
+            this.log('info', `Transient gateway status ${res.status} on ${path}; retrying (${attempt}/${this.maxRetries})`);
+            continue;
+          }
+          return res;
+        }
+
+        // Live HTTP network transport
         const response = await fetch(`${this.baseUrl}${path}`, {
           method: 'POST',
           headers,
@@ -108,14 +151,21 @@ export class MobilePaymentSdkWrapper {
       };
     }
     try {
-      const { status, payload } = await this.postWithRetry('/freeway/init-session', { sdkVersion: '1.0.0' });
-      if (status === 200 && payload.sessionId) {
+      const { payload } = await this.postWithRetry('/freeway/init-session', { sdkVersion: '1.0.0' });
+      if (payload.decision === 'ACCEPT' && payload.sessionId) {
         this.sessionId = payload.sessionId;
         return { ok: true, decision: payload.decision, reasonCode: payload.reasonCode, data: payload };
       }
-      return { ok: false, decision: payload.decision, reasonCode: payload.reasonCode };
+      return {
+        ok: false,
+        decision: payload.decision,
+        reasonCode: payload.reasonCode,
+        errorMessage: payload.errorMessage,
+        data: payload,
+      };
     } catch (err) {
-      const msg = sanitizeSensitiveData(err instanceof Error ? err.message : String(err));
+      const cause = (err as any)?.cause ? ` (cause: ${(err as any).cause.message || (err as any).cause})` : '';
+      const msg = sanitizeSensitiveData(err instanceof Error ? `${err.message}${cause}` : String(err));
       this.log('error', `Session initialization failed: ${msg}`);
       return { ok: false, decision: 'ERROR', reasonCode: 'NETWORK_ERROR', errorMessage: msg };
     }
@@ -130,12 +180,18 @@ export class MobilePaymentSdkWrapper {
       return { ok: false, decision: 'REJECT', reasonCode: 'INVALID_LUHN', errorMessage: 'Card failed client-side Luhn check' };
     }
     try {
-      const { status, payload } = await this.postWithRetry('/freeway/tokenize', {
+      const { payload } = await this.postWithRetry('/freeway/tokenize', {
         sessionId: this.sessionId,
         pan,
         cvv,
       });
-      return { ok: status === 200, decision: payload.decision, reasonCode: payload.reasonCode, data: payload };
+      return {
+        ok: payload.decision === 'ACCEPT',
+        decision: payload.decision,
+        reasonCode: payload.reasonCode,
+        errorMessage: payload.errorMessage,
+        data: payload,
+      };
     } catch (err) {
       const msg = sanitizeSensitiveData(err instanceof Error ? err.message : String(err));
       this.log('error', `Tokenization failed for ${JSON.stringify({ pan, cvv })}: ${msg}`);
@@ -147,13 +203,13 @@ export class MobilePaymentSdkWrapper {
     paymentToken: string,
     amountCents: number,
     merchantReferenceCode: string,
-    idempotencyKey = crypto.randomUUID()
+    idempotencyKey: string = crypto.randomUUID()
   ): Promise<SdkResult> {
     if (!this.sessionId) {
       return { ok: false, decision: 'REJECT', reasonCode: 'NO_ACTIVE_SESSION', errorMessage: 'Session not initialized' };
     }
     try {
-      const { status, payload } = await this.postWithRetry(
+      const { payload } = await this.postWithRetry(
         '/freeway/authorize',
         {
           sessionId: this.sessionId,
@@ -165,10 +221,70 @@ export class MobilePaymentSdkWrapper {
         },
         idempotencyKey
       );
-      return { ok: status === 200, decision: payload.decision, reasonCode: payload.reasonCode, data: payload };
+      return {
+        ok: payload.decision === 'ACCEPT',
+        decision: payload.decision,
+        reasonCode: payload.reasonCode,
+        errorMessage: payload.errorMessage,
+        data: payload,
+      };
     } catch (err) {
       const msg = sanitizeSensitiveData(err instanceof Error ? err.message : String(err));
       this.log('error', `Authorization failed: ${msg}`);
+      return { ok: false, decision: 'ERROR', reasonCode: 'NETWORK_ERROR', errorMessage: msg };
+    }
+  }
+
+  public async capturePayment(
+    authCode: string,
+    amountCents: number,
+    idempotencyKey: string = crypto.randomUUID()
+  ): Promise<SdkResult> {
+    try {
+      const { payload } = await this.postWithRetry(
+        '/freeway/capture',
+        {
+          authCode,
+          amountCents,
+        },
+        idempotencyKey
+      );
+      return {
+        ok: payload.decision === 'ACCEPT',
+        decision: payload.decision,
+        reasonCode: payload.reasonCode,
+        errorMessage: payload.errorMessage,
+        data: payload,
+      };
+    } catch (err) {
+      const msg = sanitizeSensitiveData(err instanceof Error ? err.message : String(err));
+      this.log('error', `Capture failed: ${msg}`);
+      return { ok: false, decision: 'ERROR', reasonCode: 'NETWORK_ERROR', errorMessage: msg };
+    }
+  }
+
+  public async voidPayment(
+    authCode: string,
+    idempotencyKey: string = crypto.randomUUID()
+  ): Promise<SdkResult> {
+    try {
+      const { payload } = await this.postWithRetry(
+        '/freeway/void',
+        {
+          authCode,
+        },
+        idempotencyKey
+      );
+      return {
+        ok: payload.decision === 'ACCEPT',
+        decision: payload.decision,
+        reasonCode: payload.reasonCode,
+        errorMessage: payload.errorMessage,
+        data: payload,
+      };
+    } catch (err) {
+      const msg = sanitizeSensitiveData(err instanceof Error ? err.message : String(err));
+      this.log('error', `Void failed: ${msg}`);
       return { ok: false, decision: 'ERROR', reasonCode: 'NETWORK_ERROR', errorMessage: msg };
     }
   }

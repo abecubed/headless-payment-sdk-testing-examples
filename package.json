@@ -6,7 +6,10 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "playwright test",
-    "test:ci": "npm run typecheck && playwright test --reporter=list"
+    "test:governance": "node --experimental-strip-types scripts/verify-agent-guardrails.ts",
+    "agent:explore": "node --experimental-strip-types scripts/autonomous-payment-agent.ts",
+    "test:ci": "npm run test:governance && npm run typecheck && playwright test --reporter=list",
+    "test:all": "npm run test:governance && npm run typecheck && npm test && npm run agent:explore"
   },
   "devDependencies": {
     "@playwright/test": "^1.65.1",

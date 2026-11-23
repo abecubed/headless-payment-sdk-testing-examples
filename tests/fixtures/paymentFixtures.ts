@@ -1,10 +1,13 @@
 import { test as base, expect } from '@playwright/test';
-import { PseudoPaymentMiddleware } from '../../src/middleware/server.js';
-import { MobilePaymentSdkWrapper, SdkLogger } from '../../src/mobile-sdk-wrapper/paymentSdkClient.js';
+import { PseudoPaymentMiddleware, DEFAULT_MOCK_ESKEY } from '../../src/middleware/server.ts';
+import { MobilePaymentSdkWrapper } from '../../src/mobile-sdk-wrapper/paymentSdkClient.ts';
+import type { SdkLogger } from '../../src/mobile-sdk-wrapper/paymentSdkClient.ts';
 
 export const TEST_CARDS = {
   VISA_APPROVE: '4111111111111111',
   VISA_DECLINE_DO_NOT_HONOR: '4000000000000002',
+  VISA_DECLINE_INSUFFICIENT_FUNDS: '4000000000000004',
+  VISA_DECLINE_EXPIRED: '4000000000000005',
   INVALID_LUHN: '4111111111111112',
   DEFAULT_CVV: '739',
 } as const;
@@ -45,8 +48,18 @@ export const test = base.extend<PaymentTestFixtures>({
     await use(collector);
   },
 
-  sdk: async ({ baseUrl, logs }, use) => {
-    const wrapper = new MobilePaymentSdkWrapper(baseUrl, logs, 2);
+  sdk: async ({ middleware, baseUrl, logs }, use) => {
+    const inMemoryTransport = (path: string, body: Record<string, unknown>, headers: Record<string, string>) => {
+      return middleware.dispatch('POST', path, headers, body);
+    };
+    const wrapper = new MobilePaymentSdkWrapper(
+      baseUrl,
+      logs,
+      2,
+      DEFAULT_MOCK_ESKEY,
+      'TERM_PLAYWRIGHT_01',
+      inMemoryTransport
+    );
     await use(wrapper);
   },
 });
