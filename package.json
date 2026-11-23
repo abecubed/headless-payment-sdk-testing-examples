@@ -1,0 +1,17 @@
+{
+  "name": "payment-sdk-middleware-qa-scenarios",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "playwright test",
+    "test:ci": "npm run typecheck && playwright test --reporter=list"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "@types/node": "^26.6.6",
+    "typescript": "^5.7.0",
+    "zod": "^3.24.0"
+  }
+}
